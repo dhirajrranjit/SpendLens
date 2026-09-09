@@ -70,6 +70,15 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:"DM Mon
 .card-cta::after{content:" →";}
 .footer-note{margin-top:3rem;font-size:10px;color:var(--hint);letter-spacing:.06em;text-align:center;animation:fadeUp .5s .28s ease both;}
 
+
+/* Master backup controls */
+.master-backup-bar{margin-top:22px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;animation:fadeUp .5s .22s ease both;}
+.master-backup-btn{padding:7px 13px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2);color:var(--muted);font:500 10px/1.2 "DM Mono",monospace;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;transition:all .18s;}
+.master-backup-btn:hover,.master-backup-btn:focus-visible{border-color:var(--accent);color:var(--accent);outline:none;}
+.master-backup-status{width:100%;text-align:center;min-height:16px;font-size:9px;color:var(--hint);letter-spacing:.03em;}
+#master-import-file{display:none;}
+@media(max-width:700px){.master-backup-bar{margin-top:16px;gap:7px}.master-backup-btn{flex:1 1 145px;max-width:200px;padding:9px 10px}.master-backup-status{font-size:9px}}
+
 @keyframes fadeDown{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
 @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
@@ -171,6 +180,12 @@ button:focus-visible,.module-card:focus-visible{outline:2px solid var(--accent);
         <div class="card-cta">Open Dashboard</div>
       </div>
 
+    </div>
+    <div class="master-backup-bar" aria-label="SpendLens master backup controls">
+      <button class="master-backup-btn" id="master-export-btn" type="button">Export Master Backup</button>
+      <button class="master-backup-btn" id="master-import-btn" type="button">Import Master Backup</button>
+      <input id="master-import-file" type="file" accept="application/json,.json">
+      <div class="master-backup-status" id="master-backup-status">One backup file for all SpendLens modules</div>
     </div>
     <div class="footer-note">100% local &nbsp;&middot;&nbsp; Nothing leaves your browser &nbsp;&middot;&nbsp; No tracking</div>
   </div>
@@ -9793,6 +9808,159 @@ var FIN_B64 = [
   var incDecoded = null;
   var finDecoded = null;
 
+
+  var MASTER_FORMAT = "SpendLensMasterBackup";
+  var MASTER_VERSION = 1;
+  var MASTER_RECOVERY_KEY = "spendlens_master_recovery_v1";
+  var MASTER_MODULE_KEYS = {
+    multiStatementAnalyzer: [
+      "spendlens_statements","spendlens_custom_cats","spendlens_cat_map",
+      "spendlens_vm_data","spendlens_bp","spendlens_vendors","spendlens_income"
+    ],
+    incomeExpenseTracker: [
+      "spendlens_v2_stmts","spendlens_v2_vendors","spendlens_v2_typeoverrides"
+    ],
+    financialDashboard: [
+      "spendlens_financial_v1","spendlens_financial_last_good_v1","spendlens_financial_recovery_v1"
+    ]
+  };
+
+  function masterStatus(msg, isError) {
+    var el = document.getElementById("master-backup-status");
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = isError ? "#c47b6b" : "";
+    if (!isError) setTimeout(function(){ if(el.textContent===msg){el.textContent="One backup file for all SpendLens modules";el.style.color="";} }, 5000);
+  }
+
+  function fnv1a32Master(str) {
+    var h = 0x811c9dc5;
+    for (var i=0;i<str.length;i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(16).padStart(8,"0");
+  }
+
+  function readMasterModule(keys) {
+    var out = {};
+    keys.forEach(function(key){
+      var raw = localStorage.getItem(key);
+      if (raw !== null) {
+        try { out[key] = JSON.parse(raw); }
+        catch(e) { out[key] = {__spendlensRawString: raw}; }
+      }
+    });
+    return out;
+  }
+
+  function buildMasterBackup() {
+    var modules = {};
+    Object.keys(MASTER_MODULE_KEYS).forEach(function(name){ modules[name] = readMasterModule(MASTER_MODULE_KEYS[name]); });
+    var core = {
+      format: MASTER_FORMAT,
+      version: MASTER_VERSION,
+      exportedAt: new Date().toISOString(),
+      modules: modules
+    };
+    core.integrity = {algorithm:"fnv1a32", hash:fnv1a32Master(JSON.stringify(core.modules))};
+    return core;
+  }
+
+  function downloadMasterBackup() {
+    try {
+      var backup = buildMasterBackup();
+      var blob = new Blob([JSON.stringify(backup,null,2)], {type:"application/json"});
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "spendlens_master_backup_" + new Date().toISOString().slice(0,10) + ".json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); },500);
+      masterStatus("Master backup exported — all 3 modules included");
+    } catch(err) { console.error(err); masterStatus("Master backup failed: "+err.message, true); }
+  }
+
+  function validateMasterBackup(obj) {
+    if (!obj || obj.format !== MASTER_FORMAT) throw new Error("Not a SpendLens Master Backup");
+    if (Number(obj.version) !== MASTER_VERSION) throw new Error("Unsupported master backup version");
+    if (!obj.modules || typeof obj.modules !== "object") throw new Error("Backup is missing module data");
+    ["multiStatementAnalyzer","incomeExpenseTracker","financialDashboard"].forEach(function(name){
+      if (!obj.modules[name] || typeof obj.modules[name] !== "object") throw new Error("Backup is missing "+name);
+    });
+    if (obj.integrity && obj.integrity.hash) {
+      var actual = fnv1a32Master(JSON.stringify(obj.modules));
+      if (actual !== obj.integrity.hash) throw new Error("Backup integrity check failed");
+    }
+    var fin = obj.modules.financialDashboard["spendlens_financial_v1"];
+    if (fin !== undefined && (!fin || typeof fin !== "object" || !Array.isArray(fin.accounts))) {
+      throw new Error("Financial Dashboard data is invalid");
+    }
+    var cc = obj.modules.multiStatementAnalyzer["spendlens_statements"];
+    if (cc !== undefined && !Array.isArray(cc)) throw new Error("Multi-Statement Analyzer data is invalid");
+    var inc = obj.modules.incomeExpenseTracker["spendlens_v2_stmts"];
+    if (inc !== undefined && !Array.isArray(inc)) throw new Error("Income Tracker data is invalid");
+    return true;
+  }
+
+  function snapshotCurrentRaw() {
+    var snap = {};
+    Object.keys(MASTER_MODULE_KEYS).forEach(function(name){
+      MASTER_MODULE_KEYS[name].forEach(function(key){ snap[key] = localStorage.getItem(key); });
+    });
+    return snap;
+  }
+
+  function restoreRawSnapshot(snap) {
+    Object.keys(snap).forEach(function(key){
+      if (snap[key] === null) localStorage.removeItem(key); else localStorage.setItem(key, snap[key]);
+    });
+  }
+
+  function writeMasterModules(modules) {
+    Object.keys(MASTER_MODULE_KEYS).forEach(function(name){
+      var data = modules[name] || {};
+      MASTER_MODULE_KEYS[name].forEach(function(key){
+        if (Object.prototype.hasOwnProperty.call(data,key)) {
+          var v = data[key];
+          if (v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v,"__spendlensRawString")) localStorage.setItem(key, v.__spendlensRawString);
+          else localStorage.setItem(key, JSON.stringify(v));
+        } else {
+          localStorage.removeItem(key);
+        }
+      });
+    });
+  }
+
+  function importMasterBackup(file) {
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(){
+      var obj;
+      try { obj = JSON.parse(reader.result); validateMasterBackup(obj); }
+      catch(err) { masterStatus("Import blocked: "+err.message, true); return; }
+      if (!confirm("Restore all SpendLens modules from this master backup? Current data will be saved to a local recovery backup first.")) return;
+      var before = snapshotCurrentRaw();
+      try {
+        localStorage.setItem(MASTER_RECOVERY_KEY, JSON.stringify({savedAt:new Date().toISOString(), raw:before}));
+        writeMasterModules(obj.modules);
+        // Verify that every restored JSON-backed value can be read back.
+        Object.keys(MASTER_MODULE_KEYS).forEach(function(name){
+          MASTER_MODULE_KEYS[name].forEach(function(key){
+            if (Object.prototype.hasOwnProperty.call(obj.modules[name],key)) {
+              var raw = localStorage.getItem(key); if (raw === null) throw new Error("Could not restore "+key); JSON.parse(raw);
+            }
+          });
+        });
+        masterStatus("Master restore complete — Analyzer, Income Tracker, and Financial Dashboard restored");
+        alert("SpendLens Master Backup restored successfully. All three modules were restored together.");
+      } catch(err) {
+        try { restoreRawSnapshot(before); } catch(rollbackErr) { console.error("Master rollback failed", rollbackErr); }
+        masterStatus("Restore failed; previous data was rolled back: "+err.message, true);
+      } finally {
+        var input=document.getElementById("master-import-file"); if(input) input.value="";
+      }
+    };
+    reader.onerror = function(){ masterStatus("Could not read the selected backup file", true); };
+    reader.readAsText(file);
+  }
+
   // iPhone/Safari-safe iframe loader. Using srcdoc for a local file can be
   // unreliable on iOS Safari; about:blank inherits this page's origin, so
   // the embedded apps retain the same localStorage scope while document.write
@@ -9875,6 +10043,10 @@ var FIN_B64 = [
       if(e.key==="Enter"||e.key===" "){e.preventDefault();card.click();}
     });
   });
+
+  document.getElementById("master-export-btn").addEventListener("click", downloadMasterBackup);
+  document.getElementById("master-import-btn").addEventListener("click", function(){ document.getElementById("master-import-file").click(); });
+  document.getElementById("master-import-file").addEventListener("change", function(e){ importMasterBackup(e.target.files && e.target.files[0]); });
 
   document.getElementById("back-btn").addEventListener("click", goBack);
 })();
